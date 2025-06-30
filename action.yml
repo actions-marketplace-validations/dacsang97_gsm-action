@@ -49,7 +49,20 @@ runs:
         # Determine version
         VERSION="${{ inputs.gsm-version }}"
         if [ "$VERSION" = "latest" ]; then
-          VERSION=$(curl -s https://api.github.com/repos/dacsang97/gsm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Fetching latest version from GitHub..."
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/dacsang97/gsm/releases/latest)
+          if [ $? -ne 0 ] || [ -z "$LATEST_RELEASE" ]; then
+            echo "Failed to fetch latest release info from GitHub API"
+            echo "Using fallback version: v0.0.1"
+            VERSION="v0.0.1"
+          else
+            VERSION=$(echo "$LATEST_RELEASE" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ -z "$VERSION" ]; then
+              echo "Could not parse version from GitHub API response"
+              echo "Using fallback version: v0.0.1"
+              VERSION="v0.0.1"
+            fi
+          fi
         fi
         echo "Using GSM version: $VERSION"
 
@@ -78,8 +91,25 @@ runs:
         fi
 
         echo "Downloading GSM for $PLATFORM..."
-        curl -L -o "$BINARY_NAME" "https://github.com/dacsang97/gsm/releases/download/${VERSION}/gsm-${PLATFORM}"
+        DOWNLOAD_URL="https://github.com/dacsang97/gsm/releases/download/${VERSION}/gsm-${PLATFORM}"
+        echo "Download URL: $DOWNLOAD_URL"
+
+        if ! curl -L -f -o "$BINARY_NAME" "$DOWNLOAD_URL"; then
+          echo "❌ Failed to download GSM binary from $DOWNLOAD_URL"
+          echo "Please check:"
+          echo "  - The version $VERSION exists"
+          echo "  - The platform $PLATFORM is supported"
+          echo "  - Network connectivity to GitHub"
+          exit 1
+        fi
+
+        if [ ! -f "$BINARY_NAME" ]; then
+          echo "❌ Binary file not found after download"
+          exit 1
+        fi
+
         chmod +x "$BINARY_NAME"
+        echo "✓ Downloaded GSM binary successfully"
 
         # Add to PATH
         echo "$PWD" >> $GITHUB_PATH
