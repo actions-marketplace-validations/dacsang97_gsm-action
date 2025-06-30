@@ -139,8 +139,24 @@ runs:
           
           # Extract org and repos from decrypted file
           if [ -f "$decrypted_file" ]; then
-            ORG=$(grep "^org:" "$decrypted_file" | cut -d':' -f2 | tr -d ' ')
-            REPOS=$(grep -A50 "^repositories:" "$decrypted_file" | grep "^  - " | sed 's/^  - //')
+            echo "  Reading decrypted file: $decrypted_file"
+            
+            # Safely extract org and repos
+            ORG=$(grep "^org:" "$decrypted_file" | cut -d':' -f2 | tr -d ' ' || echo "")
+            REPOS=$(grep -A50 "^repositories:" "$decrypted_file" | grep "^  - " | sed 's/^  - //' || echo "")
+            
+            if [ -z "$ORG" ]; then
+              echo "  ⚠️  Warning: No 'org' field found in $decrypted_file"
+              continue
+            fi
+            
+            if [ -z "$REPOS" ]; then
+              echo "  ⚠️  Warning: No repositories found in $decrypted_file"
+              continue
+            fi
+            
+            echo "  Organization: $ORG"
+            echo "  Repositories found: $(echo "$REPOS" | wc -l)"
             
             if [ "${{ inputs.dry-run }}" = "true" ]; then
               echo "  Dry-run mode: Validation successful"
@@ -154,8 +170,32 @@ runs:
                 # Check if this is the specific file requested
                 if [ "$REL_PATH" = "${{ inputs.specific-file }}" ]; then
                   echo "  Pushing secrets from specific file..."
-                  gsm push --file "$decrypted_file"
-                  
+                  if gsm push --file "$decrypted_file"; then
+                    echo "  ✓ Successfully pushed secrets"
+                    # Add repos to updated list
+                    for repo in $REPOS; do
+                      REPO_FULL="${ORG}/${repo}"
+                      if [ -n "$UPDATED_REPOS" ]; then
+                        if ! echo "$UPDATED_REPOS" | grep -q "$REPO_FULL"; then
+                          UPDATED_REPOS="${UPDATED_REPOS},$REPO_FULL"
+                        fi
+                      else
+                        UPDATED_REPOS="$REPO_FULL"
+                      fi
+                    done
+                  else
+                    echo "  ❌ Failed to push secrets from $decrypted_file"
+                    echo "  Please check:"
+                    echo "    - GitHub token has correct permissions (repo, admin:repo_hook)"
+                    echo "    - Organization and repository names are correct"
+                    echo "    - Repositories exist and are accessible"
+                  fi
+                fi
+              else
+                # Process all files
+                echo "  Pushing secrets..."
+                if gsm push --file "$decrypted_file"; then
+                  echo "  ✓ Successfully pushed secrets"
                   # Add repos to updated list
                   for repo in $REPOS; do
                     REPO_FULL="${ORG}/${repo}"
@@ -167,25 +207,17 @@ runs:
                       UPDATED_REPOS="$REPO_FULL"
                     fi
                   done
+                else
+                  echo "  ❌ Failed to push secrets from $decrypted_file"
+                  echo "  Please check:"
+                  echo "    - GitHub token has correct permissions (repo, admin:repo_hook)"
+                  echo "    - Organization and repository names are correct"
+                  echo "    - Repositories exist and are accessible"
                 fi
-              else
-                # Process all files
-                echo "  Pushing secrets..."
-                gsm push --file "$decrypted_file"
-                
-                # Add repos to updated list
-                for repo in $REPOS; do
-                  REPO_FULL="${ORG}/${repo}"
-                  if [ -n "$UPDATED_REPOS" ]; then
-                    if ! echo "$UPDATED_REPOS" | grep -q "$REPO_FULL"; then
-                      UPDATED_REPOS="${UPDATED_REPOS},$REPO_FULL"
-                    fi
-                  else
-                    UPDATED_REPOS="$REPO_FULL"
-                  fi
-                done
               fi
             fi
+          else
+            echo "  ⚠️  Warning: Decrypted file not found: $decrypted_file"
           fi
         done
 
