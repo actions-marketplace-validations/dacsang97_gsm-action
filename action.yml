@@ -85,7 +85,7 @@ runs:
         echo "$PWD" >> $GITHUB_PATH
 
         # Verify installation
-        ./"$BINARY_NAME" --version
+        ./"$BINARY_NAME"
 
         echo "::endgroup::"
 
@@ -98,91 +98,87 @@ runs:
       run: |
         echo "::group::Processing config files"
 
-        # Initialize output variables
-        PROCESSED_FILES=""
-        UPDATED_REPOS=""
-
         # Create temporary directory for decrypted files
         TEMP_DIR=$(mktemp -d)
         trap "rm -rf $TEMP_DIR" EXIT
 
-        # Function to extract repos from config
-        extract_repos() {
-          local file=$1
-          gsm decrypt --file "$file" --output "$TEMP_DIR/temp.yaml" 2>/dev/null
-          if [ -f "$TEMP_DIR/temp.yaml" ]; then
-            # Extract org and repositories
-            ORG=$(grep "^org:" "$TEMP_DIR/temp.yaml" | cut -d':' -f2 | tr -d ' ')
-            REPOS=$(grep -A50 "^repositories:" "$TEMP_DIR/temp.yaml" | grep "^  - " | sed 's/^  - //')
-            
-            for repo in $REPOS; do
-              echo "${ORG}/${repo}"
-            done
-            rm -f "$TEMP_DIR/temp.yaml"
+        # Copy encrypted files to temp structure
+        mkdir -p "$TEMP_DIR/encrypted"
+        cp -r "${{ inputs.config-path }}"/* "$TEMP_DIR/encrypted/" 2>/dev/null || true
+
+        # Decrypt all files using GSM's built-in command
+        echo "Decrypting all config files..."
+        gsm decrypt-all --input "$TEMP_DIR"
+
+        # Get list of decrypted files
+        DECRYPTED_FILES=$(find "$TEMP_DIR/raw" -name "*.yaml" -o -name "*.yml" 2>/dev/null | sort)
+        PROCESSED_FILES=""
+        UPDATED_REPOS=""
+
+        # Process each decrypted file
+        for decrypted_file in $DECRYPTED_FILES; do
+          # Get relative path for output
+          REL_PATH=${decrypted_file#$TEMP_DIR/raw/}
+          ENCRYPTED_PATH="${{ inputs.config-path }}/$REL_PATH"
+          
+          echo "Processing: $ENCRYPTED_PATH"
+          
+          # Add to processed files list
+          if [ -n "$PROCESSED_FILES" ]; then
+            PROCESSED_FILES="${PROCESSED_FILES},$ENCRYPTED_PATH"
+          else
+            PROCESSED_FILES="$ENCRYPTED_PATH"
           fi
-        }
-
-        # Determine which files to process
-        if [ -n "${{ inputs.specific-file }}" ]; then
-          # Process specific file
-          CONFIG_FILES="${{ inputs.config-path }}/${{ inputs.specific-file }}"
-        else
-          # Process all YAML files in config path
-          CONFIG_FILES=$(find "${{ inputs.config-path }}" -name "*.yaml" -o -name "*.yml" | sort)
-        fi
-
-        # Process each config file
-        for config_file in $CONFIG_FILES; do
-          if [ -f "$config_file" ]; then
-            echo "Processing: $config_file"
-            
-            # Add to processed files list
-            if [ -n "$PROCESSED_FILES" ]; then
-              PROCESSED_FILES="${PROCESSED_FILES},$config_file"
-            else
-              PROCESSED_FILES="$config_file"
-            fi
-            
-            # Extract repos before processing
-            REPOS_IN_FILE=$(extract_repos "$config_file")
+          
+          # Extract org and repos from decrypted file
+          if [ -f "$decrypted_file" ]; then
+            ORG=$(grep "^org:" "$decrypted_file" | cut -d':' -f2 | tr -d ' ')
+            REPOS=$(grep -A50 "^repositories:" "$decrypted_file" | grep "^  - " | sed 's/^  - //')
             
             if [ "${{ inputs.dry-run }}" = "true" ]; then
-              echo "  Dry-run mode: Validating and decrypting only..."
-              
-              # Validate the encrypted file
-              gsm validate --file "$config_file"
-              
-              # Decrypt to temp directory to verify
-              DECRYPTED_FILE="$TEMP_DIR/$(basename $config_file)"
-              gsm decrypt --file "$config_file" --output "$DECRYPTED_FILE"
-              
-              echo "  ✓ Successfully validated and decrypted"
-              echo "  Would update repos: $REPOS_IN_FILE"
-            else
-              echo "  Decrypting and pushing secrets..."
-              
-              # Decrypt to temporary location
-              DECRYPTED_FILE="$TEMP_DIR/$(basename $config_file)"
-              gsm decrypt --file "$config_file" --output "$DECRYPTED_FILE"
-              
-              # Push secrets to GitHub
-              gsm push --file "$DECRYPTED_FILE"
-              
-              echo "  ✓ Successfully pushed secrets"
-              
-              # Add repos to updated list
-              for repo in $REPOS_IN_FILE; do
-                if [ -n "$UPDATED_REPOS" ]; then
-                  if ! echo "$UPDATED_REPOS" | grep -q "$repo"; then
-                    UPDATED_REPOS="${UPDATED_REPOS},$repo"
-                  fi
-                else
-                  UPDATED_REPOS="$repo"
-                fi
+              echo "  Dry-run mode: Validation successful"
+              echo "  Would update repos:"
+              for repo in $REPOS; do
+                echo "    - ${ORG}/${repo}"
               done
+            else
+              # Process specific file if specified, otherwise process all
+              if [ -n "${{ inputs.specific-file }}" ]; then
+                # Check if this is the specific file requested
+                if [ "$REL_PATH" = "${{ inputs.specific-file }}" ]; then
+                  echo "  Pushing secrets from specific file..."
+                  gsm push --file "$decrypted_file"
+                  
+                  # Add repos to updated list
+                  for repo in $REPOS; do
+                    REPO_FULL="${ORG}/${repo}"
+                    if [ -n "$UPDATED_REPOS" ]; then
+                      if ! echo "$UPDATED_REPOS" | grep -q "$REPO_FULL"; then
+                        UPDATED_REPOS="${UPDATED_REPOS},$REPO_FULL"
+                      fi
+                    else
+                      UPDATED_REPOS="$REPO_FULL"
+                    fi
+                  done
+                fi
+              else
+                # Process all files
+                echo "  Pushing secrets..."
+                gsm push --file "$decrypted_file"
+                
+                # Add repos to updated list
+                for repo in $REPOS; do
+                  REPO_FULL="${ORG}/${repo}"
+                  if [ -n "$UPDATED_REPOS" ]; then
+                    if ! echo "$UPDATED_REPOS" | grep -q "$REPO_FULL"; then
+                      UPDATED_REPOS="${UPDATED_REPOS},$REPO_FULL"
+                    fi
+                  else
+                    UPDATED_REPOS="$REPO_FULL"
+                  fi
+                done
+              fi
             fi
-          else
-            echo "Warning: Config file not found: $config_file"
           fi
         done
 
