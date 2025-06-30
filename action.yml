@@ -84,8 +84,15 @@ runs:
         # Add to PATH
         echo "$PWD" >> $GITHUB_PATH
 
-        # Verify installation
-        ./"$BINARY_NAME"
+        # Verify installation by checking help output
+        echo "Verifying GSM installation..."
+        ./"$BINARY_NAME" help > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+          echo "✓ GSM installed successfully"
+        else
+          echo "❌ GSM installation failed"
+          exit 1
+        fi
 
         echo "::endgroup::"
 
