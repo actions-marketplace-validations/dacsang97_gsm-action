@@ -1,0 +1,35 @@
+# Raw (unencrypted) config files - NEVER commit these!
+config/raw/
+raw/
+*.raw.yaml
+*.raw.yml
+*.decrypted.yaml
+*.decrypted.yml
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+
+# Environment files
+.env
+.env.*
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# GSM binary (if stored locally)
+gsm
+gsm.exe
+
+# Audit logs (may contain sensitive info)
+audit-*.log
+security-*.log

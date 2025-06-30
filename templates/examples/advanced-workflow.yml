@@ -1,0 +1,124 @@
+name: Advanced Secrets Sync
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - "config/encrypted/**/*.yaml"
+      - "config/encrypted/**/*.yml"
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - "config/encrypted/**/*.yaml"
+      - "config/encrypted/**/*.yml"
+  workflow_dispatch:
+    inputs:
+      specific-file:
+        description: "Specific config file to process (leave empty for all)"
+        required: false
+        type: string
+      dry-run:
+        description: "Run in dry-run mode"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  validate-pr:
+    name: Validate Config Files
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Configs (Dry Run)
+        id: validate
+        uses: dacsang97/gsm-action@v1
+        with:
+          github-token: ${{ secrets.GSM_GITHUB_TOKEN }}
+          encryption-key: ${{ secrets.GSM_ENCRYPTION_KEY }}
+          config-path: config/encrypted
+          dry-run: "true"
+
+      - name: Comment PR
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const output = `### GSM Validation Results
+
+            **Status:** ${{ job.status }}
+            **Processed Files:** ${{ steps.validate.outputs.processed-files }}
+
+            View the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  sync-secrets:
+    name: Sync Secrets to Repositories
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get Changed Files
+        id: changed-files
+        if: github.event_name == 'push'
+        run: |
+          # Get list of changed encrypted config files
+          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep '^config/encrypted/.*\.ya\?ml$' || true)
+
+          if [ -n "$CHANGED" ]; then
+            # Get the first changed file (for specific-file input)
+            FIRST_FILE=$(echo "$CHANGED" | head -n1 | sed 's|^config/encrypted/||')
+            echo "first-file=$FIRST_FILE" >> $GITHUB_OUTPUT
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            
+            echo "Changed files:"
+            echo "$CHANGED"
+          else
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync Changed Secrets
+        if: github.event_name == 'push' && steps.changed-files.outputs.has-changes == 'true'
+        uses: dacsang97/gsm-action@v1
+        with:
+          github-token: ${{ secrets.GSM_GITHUB_TOKEN }}
+          encryption-key: ${{ secrets.GSM_ENCRYPTION_KEY }}
+          config-path: config/encrypted
+          specific-file: ${{ steps.changed-files.outputs.first-file }}
+
+      - name: Sync All Secrets (Manual)
+        if: github.event_name == 'workflow_dispatch'
+        uses: dacsang97/gsm-action@v1
+        with:
+          github-token: ${{ secrets.GSM_GITHUB_TOKEN }}
+          encryption-key: ${{ secrets.GSM_ENCRYPTION_KEY }}
+          config-path: config/encrypted
+          specific-file: ${{ inputs.specific-file }}
+          dry-run: ${{ inputs.dry-run }}
+
+      - name: Send Notification
+        if: success() && github.event_name != 'workflow_dispatch'
+        run: |
+          echo "Secrets successfully synced to repositories: ${{ steps.sync.outputs.updated-repos }}"
+          # Add your notification logic here (Slack, Email, etc.)

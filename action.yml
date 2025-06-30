@@ -1,0 +1,229 @@
+name: "GSM - GitHub Secrets Manager"
+description: "Automatically decrypt config files and push secrets to GitHub repositories"
+author: "dacsang97"
+branding:
+  icon: "lock"
+  color: "purple"
+
+inputs:
+  config-path:
+    description: "Path to encrypted config files"
+    required: false
+    default: "config/encrypted"
+  github-token:
+    description: "GitHub token with repo and admin:repo_hook permissions"
+    required: true
+  encryption-key:
+    description: "Master encryption key for decrypting config files"
+    required: true
+  gsm-version:
+    description: "GSM version to use"
+    required: false
+    default: "latest"
+  dry-run:
+    description: "Run in dry-run mode (decrypt only, no push)"
+    required: false
+    default: "false"
+  specific-file:
+    description: "Process only a specific config file (relative to config-path)"
+    required: false
+    default: ""
+
+outputs:
+  processed-files:
+    description: "List of processed config files"
+    value: ${{ steps.process.outputs.processed-files }}
+  updated-repos:
+    description: "List of repositories that were updated"
+    value: ${{ steps.process.outputs.updated-repos }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup GSM
+      id: setup
+      shell: bash
+      run: |
+        echo "::group::Setting up GSM"
+
+        # Determine version
+        VERSION="${{ inputs.gsm-version }}"
+        if [ "$VERSION" = "latest" ]; then
+          VERSION=$(curl -s https://api.github.com/repos/dacsang97/gsm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        fi
+        echo "Using GSM version: $VERSION"
+
+        # Determine platform
+        PLATFORM=""
+        case "${{ runner.os }}" in
+          Linux)
+            PLATFORM="linux-x86_64"
+            ;;
+          macOS)
+            if [ "${{ runner.arch }}" = "ARM64" ]; then
+              PLATFORM="macos-aarch64"
+            else
+              PLATFORM="macos-x86_64"
+            fi
+            ;;
+          Windows)
+            PLATFORM="windows-x86_64"
+            ;;
+        esac
+
+        # Download GSM
+        BINARY_NAME="gsm"
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          BINARY_NAME="gsm.exe"
+        fi
+
+        echo "Downloading GSM for $PLATFORM..."
+        curl -L -o "$BINARY_NAME" "https://github.com/dacsang97/gsm/releases/download/${VERSION}/gsm-${PLATFORM}"
+        chmod +x "$BINARY_NAME"
+
+        # Add to PATH
+        echo "$PWD" >> $GITHUB_PATH
+
+        # Verify installation
+        ./"$BINARY_NAME" --version
+
+        echo "::endgroup::"
+
+    - name: Process Config Files
+      id: process
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        ENCRYPTION_KEY: ${{ inputs.encryption-key }}
+      run: |
+        echo "::group::Processing config files"
+
+        # Initialize output variables
+        PROCESSED_FILES=""
+        UPDATED_REPOS=""
+
+        # Create temporary directory for decrypted files
+        TEMP_DIR=$(mktemp -d)
+        trap "rm -rf $TEMP_DIR" EXIT
+
+        # Function to extract repos from config
+        extract_repos() {
+          local file=$1
+          gsm decrypt --file "$file" --output "$TEMP_DIR/temp.yaml" 2>/dev/null
+          if [ -f "$TEMP_DIR/temp.yaml" ]; then
+            # Extract org and repositories
+            ORG=$(grep "^org:" "$TEMP_DIR/temp.yaml" | cut -d':' -f2 | tr -d ' ')
+            REPOS=$(grep -A50 "^repositories:" "$TEMP_DIR/temp.yaml" | grep "^  - " | sed 's/^  - //')
+            
+            for repo in $REPOS; do
+              echo "${ORG}/${repo}"
+            done
+            rm -f "$TEMP_DIR/temp.yaml"
+          fi
+        }
+
+        # Determine which files to process
+        if [ -n "${{ inputs.specific-file }}" ]; then
+          # Process specific file
+          CONFIG_FILES="${{ inputs.config-path }}/${{ inputs.specific-file }}"
+        else
+          # Process all YAML files in config path
+          CONFIG_FILES=$(find "${{ inputs.config-path }}" -name "*.yaml" -o -name "*.yml" | sort)
+        fi
+
+        # Process each config file
+        for config_file in $CONFIG_FILES; do
+          if [ -f "$config_file" ]; then
+            echo "Processing: $config_file"
+            
+            # Add to processed files list
+            if [ -n "$PROCESSED_FILES" ]; then
+              PROCESSED_FILES="${PROCESSED_FILES},$config_file"
+            else
+              PROCESSED_FILES="$config_file"
+            fi
+            
+            # Extract repos before processing
+            REPOS_IN_FILE=$(extract_repos "$config_file")
+            
+            if [ "${{ inputs.dry-run }}" = "true" ]; then
+              echo "  Dry-run mode: Validating and decrypting only..."
+              
+              # Validate the encrypted file
+              gsm validate --file "$config_file"
+              
+              # Decrypt to temp directory to verify
+              DECRYPTED_FILE="$TEMP_DIR/$(basename $config_file)"
+              gsm decrypt --file "$config_file" --output "$DECRYPTED_FILE"
+              
+              echo "  ✓ Successfully validated and decrypted"
+              echo "  Would update repos: $REPOS_IN_FILE"
+            else
+              echo "  Decrypting and pushing secrets..."
+              
+              # Decrypt to temporary location
+              DECRYPTED_FILE="$TEMP_DIR/$(basename $config_file)"
+              gsm decrypt --file "$config_file" --output "$DECRYPTED_FILE"
+              
+              # Push secrets to GitHub
+              gsm push --file "$DECRYPTED_FILE"
+              
+              echo "  ✓ Successfully pushed secrets"
+              
+              # Add repos to updated list
+              for repo in $REPOS_IN_FILE; do
+                if [ -n "$UPDATED_REPOS" ]; then
+                  if ! echo "$UPDATED_REPOS" | grep -q "$repo"; then
+                    UPDATED_REPOS="${UPDATED_REPOS},$repo"
+                  fi
+                else
+                  UPDATED_REPOS="$repo"
+                fi
+              done
+            fi
+          else
+            echo "Warning: Config file not found: $config_file"
+          fi
+        done
+
+        # Set outputs
+        echo "processed-files=$PROCESSED_FILES" >> $GITHUB_OUTPUT
+        echo "updated-repos=$UPDATED_REPOS" >> $GITHUB_OUTPUT
+
+        # Summary
+        echo ""
+        echo "Summary:"
+        echo "  Processed files: $PROCESSED_FILES"
+        if [ "${{ inputs.dry-run }}" != "true" ]; then
+          echo "  Updated repositories: $UPDATED_REPOS"
+        fi
+
+        echo "::endgroup::"
+
+    - name: Generate Summary
+      shell: bash
+      run: |
+        echo "## GSM Action Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.dry-run }}" = "true" ]; then
+          echo "**Mode:** Dry-run (validation only)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "**Mode:** Live (secrets pushed)" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        echo "### Processed Files" >> $GITHUB_STEP_SUMMARY
+        IFS=',' read -ra FILES <<< "${{ steps.process.outputs.processed-files }}"
+        for file in "${FILES[@]}"; do
+          echo "- \`$file\`" >> $GITHUB_STEP_SUMMARY
+        done
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.dry-run }}" != "true" ] && [ -n "${{ steps.process.outputs.updated-repos }}" ]; then
+          echo "### Updated Repositories" >> $GITHUB_STEP_SUMMARY
+          IFS=',' read -ra REPOS <<< "${{ steps.process.outputs.updated-repos }}"
+          for repo in "${REPOS[@]}"; do
+            echo "- \`$repo\`" >> $GITHUB_STEP_SUMMARY
+          done
+        fi

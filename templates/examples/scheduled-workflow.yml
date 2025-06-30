@@ -1,0 +1,139 @@
+name: Scheduled Secrets Sync
+
+on:
+  schedule:
+    # Run every day at 2 AM UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      force-sync:
+        description: "Force sync all configs"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  sync-all-secrets:
+    name: Daily Secrets Sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync All Secrets
+        id: sync
+        uses: dacsang97/gsm-action@v1
+        with:
+          github-token: ${{ secrets.GSM_GITHUB_TOKEN }}
+          encryption-key: ${{ secrets.GSM_ENCRYPTION_KEY }}
+          config-path: config/encrypted
+
+      - name: Create Issue on Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `[GSM] Scheduled sync failed - ${new Date().toISOString().split('T')[0]}`;
+            const body = `## Scheduled Secrets Sync Failed
+
+            The daily secrets sync has failed. Please investigate.
+
+            **Workflow Run:** [View Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            **Time:** ${new Date().toISOString()}
+
+            ### Action Required
+            1. Check the workflow logs for error details
+            2. Verify the encryption key is correct
+            3. Ensure GitHub token has proper permissions
+            4. Check if any config files are corrupted
+
+            cc: @${{ github.repository_owner }}`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['bug', 'gsm-sync', 'automated']
+            });
+
+  audit-secrets:
+    name: Audit Secret Distribution
+    runs-on: ubuntu-latest
+    needs: sync-all-secrets
+    if: success()
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate Audit Report
+        run: |
+          echo "## Secret Sync Audit Report" > audit-report.md
+          echo "" >> audit-report.md
+          echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> audit-report.md
+          echo "**Status:** ✅ Success" >> audit-report.md
+          echo "" >> audit-report.md
+          echo "### Synced Repositories" >> audit-report.md
+          echo "${{ needs.sync-all-secrets.outputs.updated-repos }}" | tr ',' '\n' | while read repo; do
+            echo "- $repo" >> audit-report.md
+          done
+          echo "" >> audit-report.md
+          echo "### Configuration Files Processed" >> audit-report.md
+          echo "${{ needs.sync-all-secrets.outputs.processed-files }}" | tr ',' '\n' | while read file; do
+            echo "- \`$file\`" >> audit-report.md
+          done
+
+          cat audit-report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Update Audit Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const date = new Date();
+            const monthYear = date.toLocaleString('default', { month: 'long', year: 'numeric' });
+            const title = `[GSM Audit] ${monthYear} - Secret Sync Report`;
+
+            // Search for existing issue
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'gsm-audit',
+              sort: 'created',
+              direction: 'desc'
+            });
+
+            const existingIssue = issues.data.find(issue => issue.title === title);
+
+            const auditEntry = `### ${date.toISOString().split('T')[0]} Sync
+            - **Status:** ✅ Success
+            - **Workflow:** [Run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            - **Repositories Updated:** ${{ needs.sync-all-secrets.outputs.updated-repos }}
+            `;
+
+            if (existingIssue) {
+              // Update existing issue
+              const currentBody = existingIssue.body || '';
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: currentBody + '\n\n' + auditEntry
+              });
+            } else {
+              // Create new issue
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: `## Monthly Secret Sync Audit Log\n\nThis issue tracks all secret synchronization activities for ${monthYear}.\n\n${auditEntry}`,
+                labels: ['gsm-audit', 'automated']
+              });
+            }

@@ -1,0 +1,27 @@
+name: Sync Secrets
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "config/encrypted/**/*.yaml"
+      - "config/encrypted/**/*.yml"
+  workflow_dispatch:
+
+jobs:
+  sync-secrets:
+    name: Sync Secrets to Repositories
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync Secrets with GSM
+        uses: dacsang97/gsm-action@v1
+        with:
+          github-token: ${{ secrets.GSM_GITHUB_TOKEN }}
+          encryption-key: ${{ secrets.GSM_ENCRYPTION_KEY }}
+          config-path: config/encrypted
