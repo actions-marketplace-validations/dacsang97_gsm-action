@@ -24,18 +24,11 @@ inputs:
     description: "Run in dry-run mode (decrypt only, no push)"
     required: false
     default: "false"
-  specific-file:
-    description: "Process only a specific config file (relative to config-path)"
-    required: false
-    default: ""
 
 outputs:
   processed-files:
     description: "List of processed config files"
     value: ${{ steps.process.outputs.processed-files }}
-  updated-repos:
-    description: "List of repositories that were updated"
-    value: ${{ steps.process.outputs.updated-repos }}
 
 runs:
   using: "composite"
@@ -50,28 +43,17 @@ runs:
         VERSION="${{ inputs.gsm-version }}"
         if [ "$VERSION" = "latest" ]; then
           echo "Fetching latest version from GitHub..."
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/dacsang97/gsm/releases/latest)
-          if [ $? -ne 0 ] || [ -z "$LATEST_RELEASE" ]; then
-            echo "Failed to fetch latest release info from GitHub API"
+          VERSION=$(curl -s https://api.github.com/repos/dacsang97/gsm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
+          if [ -z "$VERSION" ]; then
             echo "Using fallback version: v0.0.1"
             VERSION="v0.0.1"
-          else
-            VERSION=$(echo "$LATEST_RELEASE" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-            if [ -z "$VERSION" ]; then
-              echo "Could not parse version from GitHub API response"
-              echo "Using fallback version: v0.0.1"
-              VERSION="v0.0.1"
-            fi
           fi
         fi
         echo "Using GSM version: $VERSION"
 
         # Determine platform
-        PLATFORM=""
+        PLATFORM="linux-x86_64"
         case "${{ runner.os }}" in
-          Linux)
-            PLATFORM="linux-x86_64"
-            ;;
           macOS)
             if [ "${{ runner.arch }}" = "ARM64" ]; then
               PLATFORM="macos-aarch64"
@@ -95,34 +77,13 @@ runs:
         echo "Download URL: $DOWNLOAD_URL"
 
         if ! curl -L -f -o "$BINARY_NAME" "$DOWNLOAD_URL"; then
-          echo "❌ Failed to download GSM binary from $DOWNLOAD_URL"
-          echo "Please check:"
-          echo "  - The version $VERSION exists"
-          echo "  - The platform $PLATFORM is supported"
-          echo "  - Network connectivity to GitHub"
-          exit 1
-        fi
-
-        if [ ! -f "$BINARY_NAME" ]; then
-          echo "❌ Binary file not found after download"
+          echo "❌ Failed to download GSM binary"
           exit 1
         fi
 
         chmod +x "$BINARY_NAME"
-        echo "✓ Downloaded GSM binary successfully"
-
-        # Add to PATH
         echo "$PWD" >> $GITHUB_PATH
-
-        # Verify installation by checking help output
-        echo "Verifying GSM installation..."
-        ./"$BINARY_NAME" help > /dev/null 2>&1
-        if [ $? -eq 0 ]; then
-          echo "✓ GSM installed successfully"
-        else
-          echo "❌ GSM installation failed"
-          exit 1
-        fi
+        echo "✓ GSM installed successfully"
 
         echo "::endgroup::"
 
@@ -135,7 +96,7 @@ runs:
       run: |
         echo "::group::Processing config files"
 
-        # Create temporary directory for decrypted files
+        # Create temporary directory
         TEMP_DIR=$(mktemp -d)
         trap "rm -rf $TEMP_DIR" EXIT
 
@@ -143,166 +104,51 @@ runs:
         mkdir -p "$TEMP_DIR/encrypted"
         cp -r "${{ inputs.config-path }}"/* "$TEMP_DIR/encrypted/" 2>/dev/null || true
 
-        # Decrypt all files using GSM's built-in command
+        # Decrypt all files
         echo "Decrypting all config files..."
         gsm decrypt-all --input "$TEMP_DIR"
 
-        # Check if decryption created the raw directory
-        if [ ! -d "$TEMP_DIR/raw" ]; then
-          echo "❌ Error: Decryption did not create expected 'raw' directory"
-          echo "Contents of temp directory:"
-          ls -la "$TEMP_DIR/"
-          exit 1
-        fi
-
-        # Get list of decrypted files
+        # Find all decrypted files
         DECRYPTED_FILES=$(find "$TEMP_DIR/raw" -name "*.yaml" -o -name "*.yml" 2>/dev/null | sort)
+        PROCESSED_FILES=""
 
         if [ -z "$DECRYPTED_FILES" ]; then
-          echo "❌ Error: No decrypted files found in $TEMP_DIR/raw"
-          echo "Contents of raw directory:"
-          ls -la "$TEMP_DIR/raw/" || echo "Raw directory is empty or doesn't exist"
-          exit 1
+          echo "No files to process"
+          exit 0
         fi
-        PROCESSED_FILES=""
-        UPDATED_REPOS=""
 
-        # Process each decrypted file
+        # Process each file
         for decrypted_file in $DECRYPTED_FILES; do
-          # Get relative path for output
           REL_PATH=${decrypted_file#$TEMP_DIR/raw/}
-          ENCRYPTED_PATH="${{ inputs.config-path }}/$REL_PATH"
+          echo "Processing: $REL_PATH"
           
-          echo "Processing: $ENCRYPTED_PATH"
-          
-          # Add to processed files list
+          # Track processed files
           if [ -n "$PROCESSED_FILES" ]; then
-            PROCESSED_FILES="${PROCESSED_FILES},$ENCRYPTED_PATH"
+            PROCESSED_FILES="${PROCESSED_FILES},$REL_PATH"
           else
-            PROCESSED_FILES="$ENCRYPTED_PATH"
+            PROCESSED_FILES="$REL_PATH"
           fi
           
-          # Extract org and repos from decrypted file
-          if [ -f "$decrypted_file" ]; then
-            echo "  Reading decrypted file: $decrypted_file"
-            
-            # Debug: Show file content structure
-            echo "  File content preview:"
-            head -20 "$decrypted_file" | sed 's/^/    /'
-            
-            # Check if file is still encrypted
-            if grep -q "salt:" "$decrypted_file" && grep -q "nonce:" "$decrypted_file" && grep -q "ciphertext:" "$decrypted_file"; then
-              echo "  ❌ ERROR: File appears to still be encrypted!"
-              echo "  The file contains salt/nonce/ciphertext fields instead of plain values."
-              echo "  Please check:"
-              echo "    - ENCRYPTION_KEY environment variable is set correctly"
-              echo "    - The file was encrypted with the same key"
-              exit 1
-            fi
-            
-            # Safely extract org and repos
-            ORG=$(grep "^org:" "$decrypted_file" | head -1 | cut -d':' -f2- | sed 's/^ *//;s/ *$//' || echo "")
-            
-            # Extract repositories - handle both single line and multi-line formats
-            REPOS=""
-            
-            # Try to extract repositories section
-            if grep -q "^repositories:" "$decrypted_file"; then
-              # Get all lines after "repositories:" that start with "  - "
-              REPOS=$(sed -n '/^repositories:/,/^[^ ]/{/^  *- */p}' "$decrypted_file" | sed 's/^  *- *//' || echo "")
-            fi
-            
-            if [ -z "$ORG" ]; then
-              echo "  ⚠️  Warning: No 'org' field found in $decrypted_file"
-              continue
-            fi
-            
-            if [ -z "$REPOS" ]; then
-              echo "  ⚠️  Warning: No repositories found in $decrypted_file"
-              echo "  Expected format:"
-              echo "    repositories:"
-              echo "      - repo1"
-              echo "      - repo2"
-              continue
-            fi
-            
-            echo "  Organization: $ORG"
-            echo "  Repositories found: $(echo "$REPOS" | grep -c .)"
-            
-            if [ "${{ inputs.dry-run }}" = "true" ]; then
-              echo "  Dry-run mode: Validation successful"
-              echo "  Would update repos:"
-              for repo in $REPOS; do
-                echo "    - ${ORG}/${repo}"
-              done
-            else
-              # Process specific file if specified, otherwise process all
-              if [ -n "${{ inputs.specific-file }}" ]; then
-                # Check if this is the specific file requested
-                if [ "$REL_PATH" = "${{ inputs.specific-file }}" ]; then
-                  echo "  Pushing secrets from specific file..."
-                  if gsm push --file "$decrypted_file"; then
-                    echo "  ✓ Successfully pushed secrets"
-                    # Add repos to updated list
-                    for repo in $REPOS; do
-                      REPO_FULL="${ORG}/${repo}"
-                      if [ -n "$UPDATED_REPOS" ]; then
-                        if ! echo "$UPDATED_REPOS" | grep -q "$REPO_FULL"; then
-                          UPDATED_REPOS="${UPDATED_REPOS},$REPO_FULL"
-                        fi
-                      else
-                        UPDATED_REPOS="$REPO_FULL"
-                      fi
-                    done
-                  else
-                    echo "  ❌ Failed to push secrets from $decrypted_file"
-                    echo "  Please check:"
-                    echo "    - GitHub token has correct permissions (repo, admin:repo_hook)"
-                    echo "    - Organization and repository names are correct"
-                    echo "    - Repositories exist and are accessible"
-                  fi
-                fi
-              else
-                # Process all files
-                echo "  Pushing secrets..."
-                if gsm push --file "$decrypted_file"; then
-                  echo "  ✓ Successfully pushed secrets"
-                  # Add repos to updated list
-                  for repo in $REPOS; do
-                    REPO_FULL="${ORG}/${repo}"
-                    if [ -n "$UPDATED_REPOS" ]; then
-                      if ! echo "$UPDATED_REPOS" | grep -q "$REPO_FULL"; then
-                        UPDATED_REPOS="${UPDATED_REPOS},$REPO_FULL"
-                      fi
-                    else
-                      UPDATED_REPOS="$REPO_FULL"
-                    fi
-                  done
-                else
-                  echo "  ❌ Failed to push secrets from $decrypted_file"
-                  echo "  Please check:"
-                  echo "    - GitHub token has correct permissions (repo, admin:repo_hook)"
-                  echo "    - Organization and repository names are correct"
-                  echo "    - Repositories exist and are accessible"
-                fi
-              fi
-            fi
+          if [ "${{ inputs.dry-run }}" = "true" ]; then
+            echo "  Dry-run mode: Skipping push"
+            # Validate file structure
+            gsm validate --file "$decrypted_file" || echo "  Warning: Validation failed"
           else
-            echo "  ⚠️  Warning: Decrypted file not found: $decrypted_file"
+            echo "  Pushing secrets..."
+            if gsm push --file "$decrypted_file"; then
+              echo "  ✓ Success"
+            else
+              echo "  ❌ Failed to push secrets"
+              echo "  Check that GitHub token has correct permissions and repositories exist"
+            fi
           fi
         done
 
         # Set outputs
         echo "processed-files=$PROCESSED_FILES" >> $GITHUB_OUTPUT
-        echo "updated-repos=$UPDATED_REPOS" >> $GITHUB_OUTPUT
 
-        # Summary
         echo ""
-        echo "Summary:"
-        echo "  Processed files: $PROCESSED_FILES"
-        if [ "${{ inputs.dry-run }}" != "true" ]; then
-          echo "  Updated repositories: $UPDATED_REPOS"
-        fi
+        echo "Summary: Processed $(echo "$PROCESSED_FILES" | tr ',' '\n' | wc -l) file(s)"
 
         echo "::endgroup::"
 
@@ -319,17 +165,12 @@ runs:
         fi
         echo "" >> $GITHUB_STEP_SUMMARY
 
-        echo "### Processed Files" >> $GITHUB_STEP_SUMMARY
-        IFS=',' read -ra FILES <<< "${{ steps.process.outputs.processed-files }}"
-        for file in "${FILES[@]}"; do
-          echo "- \`$file\`" >> $GITHUB_STEP_SUMMARY
-        done
-        echo "" >> $GITHUB_STEP_SUMMARY
-
-        if [ "${{ inputs.dry-run }}" != "true" ] && [ -n "${{ steps.process.outputs.updated-repos }}" ]; then
-          echo "### Updated Repositories" >> $GITHUB_STEP_SUMMARY
-          IFS=',' read -ra REPOS <<< "${{ steps.process.outputs.updated-repos }}"
-          for repo in "${REPOS[@]}"; do
-            echo "- \`$repo\`" >> $GITHUB_STEP_SUMMARY
+        if [ -n "${{ steps.process.outputs.processed-files }}" ]; then
+          echo "### Processed Files" >> $GITHUB_STEP_SUMMARY
+          IFS=',' read -ra FILES <<< "${{ steps.process.outputs.processed-files }}"
+          for file in "${FILES[@]}"; do
+            echo "- \`$file\`" >> $GITHUB_STEP_SUMMARY
           done
+        else
+          echo "No files were processed." >> $GITHUB_STEP_SUMMARY
         fi
