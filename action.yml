@@ -147,8 +147,23 @@ runs:
         echo "Decrypting all config files..."
         gsm decrypt-all --input "$TEMP_DIR"
 
+        # Check if decryption created the raw directory
+        if [ ! -d "$TEMP_DIR/raw" ]; then
+          echo "❌ Error: Decryption did not create expected 'raw' directory"
+          echo "Contents of temp directory:"
+          ls -la "$TEMP_DIR/"
+          exit 1
+        fi
+
         # Get list of decrypted files
         DECRYPTED_FILES=$(find "$TEMP_DIR/raw" -name "*.yaml" -o -name "*.yml" 2>/dev/null | sort)
+
+        if [ -z "$DECRYPTED_FILES" ]; then
+          echo "❌ Error: No decrypted files found in $TEMP_DIR/raw"
+          echo "Contents of raw directory:"
+          ls -la "$TEMP_DIR/raw/" || echo "Raw directory is empty or doesn't exist"
+          exit 1
+        fi
         PROCESSED_FILES=""
         UPDATED_REPOS=""
 
@@ -171,9 +186,31 @@ runs:
           if [ -f "$decrypted_file" ]; then
             echo "  Reading decrypted file: $decrypted_file"
             
+            # Debug: Show file content structure
+            echo "  File content preview:"
+            head -20 "$decrypted_file" | sed 's/^/    /'
+            
+            # Check if file is still encrypted
+            if grep -q "salt:" "$decrypted_file" && grep -q "nonce:" "$decrypted_file" && grep -q "ciphertext:" "$decrypted_file"; then
+              echo "  ❌ ERROR: File appears to still be encrypted!"
+              echo "  The file contains salt/nonce/ciphertext fields instead of plain values."
+              echo "  Please check:"
+              echo "    - ENCRYPTION_KEY environment variable is set correctly"
+              echo "    - The file was encrypted with the same key"
+              exit 1
+            fi
+            
             # Safely extract org and repos
-            ORG=$(grep "^org:" "$decrypted_file" | cut -d':' -f2 | tr -d ' ' || echo "")
-            REPOS=$(grep -A50 "^repositories:" "$decrypted_file" | grep "^  - " | sed 's/^  - //' || echo "")
+            ORG=$(grep "^org:" "$decrypted_file" | head -1 | cut -d':' -f2- | sed 's/^ *//;s/ *$//' || echo "")
+            
+            # Extract repositories - handle both single line and multi-line formats
+            REPOS=""
+            
+            # Try to extract repositories section
+            if grep -q "^repositories:" "$decrypted_file"; then
+              # Get all lines after "repositories:" that start with "  - "
+              REPOS=$(sed -n '/^repositories:/,/^[^ ]/{/^  *- */p}' "$decrypted_file" | sed 's/^  *- *//' || echo "")
+            fi
             
             if [ -z "$ORG" ]; then
               echo "  ⚠️  Warning: No 'org' field found in $decrypted_file"
@@ -182,11 +219,15 @@ runs:
             
             if [ -z "$REPOS" ]; then
               echo "  ⚠️  Warning: No repositories found in $decrypted_file"
+              echo "  Expected format:"
+              echo "    repositories:"
+              echo "      - repo1"
+              echo "      - repo2"
               continue
             fi
             
             echo "  Organization: $ORG"
-            echo "  Repositories found: $(echo "$REPOS" | wc -l)"
+            echo "  Repositories found: $(echo "$REPOS" | grep -c .)"
             
             if [ "${{ inputs.dry-run }}" = "true" ]; then
               echo "  Dry-run mode: Validation successful"
